@@ -1,0 +1,414 @@
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ROS 2 IoT Monitoring & Latency Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/roslib/build/roslib.min.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1000px;
+      margin: 30px auto;
+      padding: 0 18px;
+      background: #f4f6f8;
+      color: #202124;
+    }
+
+    h1 { margin-bottom: 8px; }
+
+    .status, .sensor {
+      background: white;
+      border-radius: 10px;
+      padding: 18px;
+      margin: 14px 0;
+      box-shadow: 0 2px 8px #00000010;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
+    }
+
+    .value {
+      font-size: 26px;
+      font-weight: bold;
+      margin-top: 10px;
+      overflow-wrap: anywhere;
+    }
+
+    .label { color: #5f6368; }
+
+    #connection { font-weight: bold; }
+
+    button, select {
+      padding: 10px 12px;
+      margin: 5px 5px 5px 0;
+      font-size: 15px;
+    }
+
+    button { cursor: pointer; }
+
+    button:disabled { cursor: not-allowed; }
+
+    .note {
+      color: #5f6368;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>ROS 2 IoT Monitoring</h1>
+  <p>Raspberry Pi 5 · ROS 2 Jazzy · Topic /sensor_data</p>
+
+  <div class="status">
+    <h3>Koneksi ROS 2</h3>
+    WebSocket: <span id="connection">Menghubungkan...</span>
+    <p>Alamat: <span id="address"></span></p>
+    <p>Total pesan diterima: <span id="count">0</span></p>
+    <p>Pesan terakhir: <span id="lastTime">-</span></p>
+  </div>
+
+  <div class="grid">
+    <div class="sensor">
+      <div class="label">Suhu</div>
+      <div class="value" id="temperature">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Kelembapan</div>
+      <div class="value" id="humidity">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">LDR</div>
+      <div class="value" id="ldr">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Soil Moisture</div>
+      <div class="value" id="soil">-</div>
+    </div>
+  </div>
+
+  <div class="status">
+    <h2>Pengujian Latensi End-to-End</h2>
+
+    <p class="note">
+      Latensi dihitung dari send_epoch_ms pada ESP32 sampai waktu
+      penerimaan pesan di browser. Pastikan jam ESP32 dan MacBook
+      tersinkronisasi sebelum pengujian.
+    </p>
+
+    <label for="environment">Lingkungan pengujian:</label><br>
+    <select id="environment">
+      <option value="native">Native</option>
+      <option value="docker">Docker</option>
+    </select>
+
+    <br>
+
+    <label for="duration">Durasi pengujian:</label><br>
+    <select id="duration">
+      <option value="15">15 detik</option>
+      <option value="45">45 detik</option>
+    </select>
+
+    <br>
+
+    <button id="startBtn" disabled>Mulai Pengukuran</button>
+    <button id="stopBtn" disabled>Hentikan</button>
+    <button id="downloadBtn" disabled>Unduh CSV</button>
+
+    <p>Status pengujian: <strong id="testStatus">Belum dimulai</strong></p>
+    <p>Sisa waktu: <span id="remaining">-</span></p>
+    <p>Pesan tercatat: <span id="testCount">0</span></p>
+  </div>
+
+  <div class="grid">
+    <div class="sensor">
+      <div class="label">Rata-rata latensi</div>
+      <div class="value" id="avgLatency">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Median latensi</div>
+      <div class="value" id="medianLatency">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Minimum latensi</div>
+      <div class="value" id="minLatency">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Maksimum latensi</div>
+      <div class="value" id="maxLatency">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">P95 latensi</div>
+      <div class="value" id="p95Latency">-</div>
+    </div>
+    <div class="sensor">
+      <div class="label">Latensi negatif</div>
+      <div class="value" id="negativeCount">0</div>
+    </div>
+  </div>
+
+  <div class="status">
+    <h3>Data JSON terakhir</h3>
+    <pre id="rawData">Belum ada data.</pre>
+  </div>
+
+<script>
+  const rosUrl = `ws://${window.location.hostname}:9090`;
+  document.getElementById("address").textContent = rosUrl;
+
+  const $ = id => document.getElementById(id);
+
+  let messageCount = 0;
+  let connected = false;
+  let measuring = false;
+  let testStartedAt = null;
+  let testEndsAt = null;
+  let endTimer = null;
+  let countdownTimer = null;
+  let testMetadata = null;
+  let samples = [];
+
+  const ros = new ROSLIB.Ros({ url: rosUrl });
+
+  ros.on("connection", () => {
+    connected = true;
+    $("connection").textContent = "Terhubung";
+    $("connection").style.color = "green";
+    $("startBtn").disabled = measuring;
+  });
+
+  ros.on("error", error => {
+    $("connection").textContent = "Terjadi kesalahan";
+    $("connection").style.color = "red";
+    console.error("ROS connection error:", error);
+  });
+
+  ros.on("close", () => {
+    connected = false;
+    $("connection").textContent = "Terputus";
+    $("connection").style.color = "red";
+    $("startBtn").disabled = true;
+  });
+
+  const topic = new ROSLIB.Topic({
+    ros,
+    name: "/sensor_data",
+    messageType: "std_msgs/msg/String"
+  });
+
+  topic.subscribe(message => {
+    // Waktu penerimaan dicatat sedini mungkin di callback.
+    const receivedEpochMs = Date.now();
+    const receivedPerformanceMs = performance.now();
+
+    messageCount++;
+    $("count").textContent = messageCount;
+    $("lastTime").textContent = new Date(receivedEpochMs).toLocaleTimeString();
+
+    let data;
+
+    try {
+      data = JSON.parse(message.data);
+
+      $("temperature").textContent = data.temperature ?? "-";
+      $("humidity").textContent = data.humidity ?? "-";
+      $("ldr").textContent = data.ldr ?? "-";
+      $("soil").textContent = data.soil ?? "-";
+      $("rawData").textContent = JSON.stringify(data, null, 2);
+    } catch (error) {
+      $("rawData").textContent = message.data;
+      console.error("Gagal membaca JSON:", error);
+      return;
+    }
+
+    if (!measuring) return;
+
+    const seq = Number(data.seq);
+    const sendEpochMs = Number(data.send_epoch_ms);
+
+    if (!Number.isFinite(seq) || !Number.isFinite(sendEpochMs) ||
+        sendEpochMs <= 0) {
+      return;
+    }
+
+    // Abaikan pesan yang tiba setelah batas waktu pengujian.
+    if (receivedPerformanceMs > testEndsAt) return;
+
+    const latencyMs = receivedEpochMs - sendEpochMs;
+
+    samples.push({
+      timestamp_received: new Date(receivedEpochMs).toISOString(),
+      elapsed_seconds: Number(
+        ((receivedPerformanceMs - testStartedAt) / 1000).toFixed(4)
+      ),
+      environment: testMetadata.environment,
+      duration_seconds: testMetadata.duration,
+      seq: seq,
+      send_epoch_ms: sendEpochMs,
+      receive_epoch_ms: receivedEpochMs,
+      latency_ms: Number(latencyMs.toFixed(3))
+    });
+
+    $("testCount").textContent = samples.length;
+  });
+
+  function percentile(sortedValues, p) {
+    if (!sortedValues.length) return null;
+
+    // Nearest-rank percentile.
+    const index = Math.max(0, Math.ceil(p * sortedValues.length) - 1);
+    return sortedValues[index];
+  }
+
+  function formatMs(value) {
+    return value === null ? "-" : `${value.toFixed(3)} ms`;
+  }
+
+  function showStatistics() {
+    // Statistik latensi hanya memakai sampel non-negatif.
+    // Sampel negatif tetap disimpan di CSV untuk pemeriksaan sinkronisasi.
+    const valid = samples
+      .map(s => s.latency_ms)
+      .filter(value => value >= 0)
+      .sort((a, b) => a - b);
+
+    $("negativeCount").textContent =
+      samples.filter(s => s.latency_ms < 0).length;
+
+    if (!valid.length) {
+      $("avgLatency").textContent = "-";
+      $("medianLatency").textContent = "-";
+      $("minLatency").textContent = "-";
+      $("maxLatency").textContent = "-";
+      $("p95Latency").textContent = "-";
+      return;
+    }
+
+    const sum = valid.reduce((total, value) => total + value, 0);
+    const middle = Math.floor(valid.length / 2);
+    const median = valid.length % 2
+      ? valid[middle]
+      : (valid[middle - 1] + valid[middle]) / 2;
+
+    $("avgLatency").textContent = formatMs(sum / valid.length);
+    $("medianLatency").textContent = formatMs(median);
+    $("minLatency").textContent = formatMs(valid[0]);
+    $("maxLatency").textContent = formatMs(valid[valid.length - 1]);
+    $("p95Latency").textContent = formatMs(percentile(valid, 0.95));
+  }
+
+  function finishMeasurement(reason) {
+    if (!measuring) return;
+
+    measuring = false;
+    clearTimeout(endTimer);
+    clearInterval(countdownTimer);
+
+    $("testStatus").textContent = reason;
+    $("startBtn").disabled = !connected;
+    $("stopBtn").disabled = true;
+    $("downloadBtn").disabled = samples.length === 0;
+    $("remaining").textContent = "0 detik";
+
+    showStatistics();
+  }
+
+  function updateCountdown() {
+    if (!measuring) return;
+
+    const remaining = Math.max(0, (testEndsAt - performance.now()) / 1000);
+    $("remaining").textContent = `${remaining.toFixed(1)} detik`;
+  }
+
+  $("startBtn").addEventListener("click", () => {
+    if (!connected || measuring) return;
+
+    const duration = Number($("duration").value);
+    const environment = $("environment").value;
+
+    samples = [];
+    testMetadata = { duration, environment };
+
+    testStartedAt = performance.now();
+    testEndsAt = testStartedAt + duration * 1000;
+    measuring = true;
+
+    $("testCount").textContent = "0";
+    $("testStatus").textContent = "Sedang mengukur";
+    $("downloadBtn").disabled = true;
+    $("startBtn").disabled = true;
+    $("stopBtn").disabled = false;
+
+    showStatistics();
+    updateCountdown();
+
+    countdownTimer = setInterval(updateCountdown, 100);
+    endTimer = setTimeout(
+      () => finishMeasurement("Selesai"),
+      duration * 1000
+    );
+  });
+
+  $("stopBtn").addEventListener("click", () => {
+    finishMeasurement("Dihentikan manual");
+  });
+
+  $("downloadBtn").addEventListener("click", () => {
+    if (!samples.length || !testMetadata) return;
+
+    const columns = [
+      "timestamp_received",
+      "elapsed_seconds",
+      "environment",
+      "duration_seconds",
+      "seq",
+      "send_epoch_ms",
+      "receive_epoch_ms",
+      "latency_ms"
+    ];
+
+    const escapeCsv = value => {
+      const text = String(value ?? "");
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+
+    const lines = [
+      columns.join(","),
+      ...samples.map(sample =>
+        columns.map(column => escapeCsv(sample[column])).join(",")
+      )
+    ];
+
+    const blob = new Blob(
+      ["\uFEFF" + lines.join("\r\n")],
+      { type: "text/csv;charset=utf-8;" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download =
+      `latency_${testMetadata.environment}_${testMetadata.duration}s_` +
+      `${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  });
+</script>
+</body>
+</html>

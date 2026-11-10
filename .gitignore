@@ -1,0 +1,19 @@
+.DS_Store
+
+# ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node.js
+node_modules/
+dist/
+
+# Environment
+.env
